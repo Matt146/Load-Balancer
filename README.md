@@ -14,6 +14,8 @@ localhost:85
 ```
 
 2. Start the instances of your server.
-3. Start the load balancer
+3. Build the load balancer (go build loadbalancer.go)
    
-   Also, it binds to port 80.
+4. Run the build
+   
+   Also, keep in mind that it binds to port 80
