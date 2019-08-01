@@ -14,6 +14,6 @@ localhost:85
 ```
 
 2. Start the instances of your server.
-3. Start the load balancer (sudo go run loadbalancer.go) 
+3. Start the load balancer
    
    Also, it binds to port 80.
