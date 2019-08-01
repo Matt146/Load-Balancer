@@ -8,15 +8,20 @@ import (
     "strconv"
     "time"
     "io/ioutil"
-    "strings"
     "os"
+
+    "github.com/go-yaml/yaml"
 )
 
 var wg sync.WaitGroup
 
 const (
-    MAX_SERVERS = 128
+    MAX_SERVERS = 10240
 )
+
+type YAMLServerList struct {
+    ServerList []string `yaml:"servers"`
+}
 
 type Balancer struct {
     ServerIPs []string      /*A list of the server IP's*/
@@ -25,14 +30,23 @@ type Balancer struct {
     RequestCount int64     /*The number of requests processed*/
 }
 
+/*LogEvent: Used to log ALL events and keep structured logging present*/
+func LogEvent(typeOf string, function string, value string, id string) {
+    log.Printf("type=%s, function=%s, value=%v, id=%s\n", typeOf, function, value, id)
+}
+
 /*RemoveFromSlice: Removes an element from a slice based off of its index*/
-func RemoveFromSlice(slice []string, s int) []string {
-    return append(slice[:s], slice[s+1:]...)
+func RemoveFromSlice(slice []string, i int) []string{
+    if i >= len(slice){
+        return slice
+    }
+    slice[i], slice[len(slice)-1] = slice[len(slice)-1], slice[i]
+    return slice[:len(slice)-1]
 }
 
 /*MakeBalancer: Initializes the load balancer*/
 func MakeBalancer() (b *Balancer) {
-    balancer := &Balancer{ServerIPs: make([]string, 0, 128), ServerErrors: make(map[string]uint32), CurrentServer: 0, RequestCount: 0}
+    balancer := &Balancer{ServerIPs: make([]string, 0, MAX_SERVERS), ServerErrors: make(map[string]uint32), CurrentServer: 0, RequestCount: 0}
     return balancer
 }
 
@@ -40,35 +54,41 @@ func (b *Balancer) ReadServerList(fname string) {
     f, err := os.Open(fname)
     defer f.Close();
     if err != nil {
-        log.Println("type=error function=Balancer.ReadServerList(); value=fopen-error from=nil id=nil")
+        LogEvent("error", "Balancer.ReadServerList", "Unable to open server list file: " + err.Error(), "nil")
     }
     fdata, err := ioutil.ReadAll(f)
     if err != nil {
-        log.Println("type=error function=Balancer.ReadServerList(); value=fread-error from=nil id=nil")
+        LogEvent("error", "Balancer.ReadServerList", "Unable to read server list: " + err.Error(), "nil")
     }
-    fdataStr := string(fdata)
-    fdataStrSplit := strings.Split(fdataStr, "\n")
-    for _, v := range fdataStrSplit {
+    serverList := YAMLServerList{make([]string, 0, MAX_SERVERS)}
+    err = yaml.Unmarshal(fdata, &serverList)
+    if err != nil {
+        LogEvent("error", "Balancer.ReadServerList", "Unable to parse YAML in server list: " + err.Error(), "nil")
+    }
+    for _, v := range serverList.ServerList{
         b.ServerIPs = append(b.ServerIPs, v)
     }
+    fmt.Printf("\n\n%v\n\n", b.ServerIPs)
+    fmt.Printf("\n\n%v\n\n", serverList.ServerList)
+    LogEvent("success", "Balancer.ReadServerList", "Read server list!", "nil")
 }
 
 /*GeneralHandleFunc: All HTTP requests are routed through here.*/
 func (b *Balancer) GeneralHandleFunc(w http.ResponseWriter, r *http.Request) {
     wg.Add(1)
     if b.ServerIPs[0] == "" {
-        panic("[Error]: All Servers are dead!")
+        LogEvent("crash", "Balancer.GeneralHandleFunc", "All servers down!", "nil")
     }
     fmt.Printf("\n[Servers] %v\n", b.ServerIPs)
     fmt.Printf("\t%s\n", b.ServerIPs[b.CurrentServer])
-    log.Println("type=incoming function=Balancer.GeneralHandleFunc(); value=newrequest from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+    LogEvent("incoming", "Balancer.GeneralHandleFunc", r.Method + " " + r.URL.Path + " (" + r.RemoteAddr + ")", strconv.FormatInt(b.RequestCount, 16))
     request, err := http.NewRequest(r.Method, "http://" + b.ServerIPs[b.CurrentServer] + r.URL.Path, r.Body)
     if err != nil {
-        log.Println("type=error function=Balancer.GeneralHandleFunc(); value=badrequest from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+        LogEvent("error", "Balancer.GeneralHandleFunc", "Unable to initialize request to application server: " + err.Error(), strconv.FormatInt(b.RequestCount, 16))
         w.WriteHeader(http.StatusBadRequest)
         b.ServerErrors[b.ServerIPs[b.CurrentServer]] += 1
         if b.ServerErrors[b.ServerIPs[b.CurrentServer]] >= 3 {
-            log.Println("type=server-removed function=Balancer.GeneralHandleFunc(); value=" + b.ServerIPs[b.CurrentServer] + "from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+            LogEvent("server-removed", "Balancer.GeneralHandleFunc", b.ServerIPs[b.CurrentServer], strconv.FormatInt(b.RequestCount, 16))
             RemoveFromSlice(b.ServerIPs, b.CurrentServer)
         }
         return
@@ -82,12 +102,12 @@ func (b *Balancer) GeneralHandleFunc(w http.ResponseWriter, r *http.Request) {
     client := http.Client{Timeout: time.Second * 3}
     response, err := client.Do(request)
     if err != nil {
-        log.Println("type=error function=Balancer.GeneralHandleFunc(); value=badresponse from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+        LogEvent("error", "Balancer.GeneralHandleFunc", "Unable to send request to application server: " + err.Error(), strconv.FormatInt(b.RequestCount, 16))
         fmt.Printf("\t" + err.Error())
         w.WriteHeader(http.StatusInternalServerError)
         b.ServerErrors[b.ServerIPs[b.CurrentServer]] += 1
         if b.ServerErrors[b.ServerIPs[b.CurrentServer]] >= 3 {
-            log.Println("type=server-removed function=Balancer.GeneralHandleFunc(); value=" + b.ServerIPs[b.CurrentServer] + "from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+            LogEvent("server-removed", "Balancer.GeneralHandleFunc", b.ServerIPs[b.CurrentServer], strconv.FormatInt(b.RequestCount, 16))
             RemoveFromSlice(b.ServerIPs, b.CurrentServer)
         }
         return
@@ -95,23 +115,24 @@ func (b *Balancer) GeneralHandleFunc(w http.ResponseWriter, r *http.Request) {
     defer response.Body.Close()
     responseBytes, err := ioutil.ReadAll(response.Body)
     if err != nil {
-        log.Println("type=error function=Balancer.GeneralHandleFunc(); value=badresponse from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+        LogEvent("error", "Balancer.GeneralHandleFunc", "Unable to read response from application server: " + err.Error(), strconv.FormatInt(b.RequestCount, 16))
         fmt.Printf("\t" + err.Error())
         w.WriteHeader(http.StatusInternalServerError)
         b.ServerErrors[b.ServerIPs[b.CurrentServer]] += 1
         if b.ServerErrors[b.ServerIPs[b.CurrentServer]] >= 3 {
-            log.Println("type=server-removed function=Balancer.GeneralHandleFunc(); value=" + b.ServerIPs[b.CurrentServer] + "from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+            LogEvent("server-removed", "Balancer.GeneralHandleFunc", b.ServerIPs[b.CurrentServer], strconv.FormatInt(b.RequestCount, 16))
             RemoveFromSlice(b.ServerIPs, b.CurrentServer)
         }
         return
     }
     w.WriteHeader(http.StatusOK)
     w.Write(responseBytes)
-    log.Println("type=success function=Balancer.GeneralHandleFunc(); value=requestforwarded from=" + r.RemoteAddr + " id=" + strconv.FormatInt(b.RequestCount, 16))
+    LogEvent("success", "Balancer.GeneralHandleFunc", "Succeeded in sending request: " + r.Method + " " + r.URL.Path + " (" + r.RemoteAddr + ")", strconv.FormatInt(b.RequestCount, 16))
     b.CurrentServer += 1
-    if b.CurrentServer >= len(b.ServerIPs)-1 || b.CurrentServer >= cap(b.ServerIPs){
+    if b.CurrentServer == len(b.ServerIPs) {
         b.CurrentServer = 0
     }
+    b.RequestCount += 1
     wg.Done()
 }
 
@@ -135,9 +156,9 @@ func WelcomeMessage() {
 
 func main() {
     WelcomeMessage()
-    log.Println("type=startup function=main(); value=startingserver! from=nil id=STARTUP")
+    LogEvent("startup", "main", "Starting server!", "nil")
     b := MakeBalancer()
-    b.ReadServerList("servers.txt")
+    b.ReadServerList("servers.yml")
     http.HandleFunc("/", b.GeneralHandleFunc)
     http.ListenAndServe(":80", nil)
 }
